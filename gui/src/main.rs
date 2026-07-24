@@ -16,7 +16,7 @@ use rusty_clicker_core::{
     run, ClickPlan, Clicker, EnigoClicker, Interval, MouseButton, RealSleeper, Repeat, Target,
 };
 
-const STOP_HOTKEY_LABEL: &str = "Ctrl+Shift+F6";
+const DEFAULT_HOTKEY_LABEL: &str = "Ctrl+Shift+F6";
 
 // --- Palette -------------------------------------------------------------
 const BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1B);
@@ -83,7 +83,10 @@ struct App {
     status: Arc<Mutex<Status>>,
 
     hotkey_manager: Option<GlobalHotKeyManager>,
-    stop_hotkey: Option<HotKey>,
+    hotkey: Option<HotKey>,
+    hotkey_label: String,
+    capturing: bool,
+    hotkey_error: Option<String>,
 }
 
 impl Default for App {
@@ -103,7 +106,10 @@ impl Default for App {
             count: Arc::new(AtomicU64::new(0)),
             status: Arc::new(Mutex::new(Status::Idle)),
             hotkey_manager: None,
-            stop_hotkey: None,
+            hotkey: None,
+            hotkey_label: DEFAULT_HOTKEY_LABEL.to_string(),
+            capturing: false,
+            hotkey_error: None,
         }
     }
 }
@@ -197,6 +203,59 @@ impl App {
     fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+
+    fn toggle(&self) {
+        if self.is_running() {
+            self.stop();
+        } else {
+            self.start();
+        }
+    }
+
+    /// Register a new toggle combo, releasing the old one only once the new one
+    /// takes. On failure the old binding stays live and an error is surfaced.
+    fn rebind(&mut self, code: Code, mods: Modifiers, label: String) {
+        let Some(mgr) = &self.hotkey_manager else {
+            return;
+        };
+        let new = HotKey::new((!mods.is_empty()).then_some(mods), code);
+        if self.hotkey.map(|h| h.id()) == Some(new.id()) {
+            self.hotkey_error = None; // same combo — nothing to do
+            return;
+        }
+        match mgr.register(new) {
+            Ok(()) => {
+                if let Some(old) = self.hotkey.replace(new) {
+                    let _ = mgr.unregister(old);
+                }
+                self.hotkey_label = label;
+                self.hotkey_error = None;
+            }
+            Err(_) => {
+                self.hotkey_error = Some(format!("{label} is already in use — try another"));
+            }
+        }
+    }
+}
+
+/// egui key -> global-hotkey code, via their shared variant names. Supports
+/// letters, digits, F-keys, and the handful of named keys that round-trip.
+fn egui_key_to_code(key: egui::Key) -> Option<Code> {
+    let name = format!("{key:?}");
+    let code = if name.len() == 1 && name.as_bytes()[0].is_ascii_alphabetic() {
+        format!("Key{name}")
+    } else if let Some(d) = name.strip_prefix("Num") {
+        format!("Digit{d}")
+    } else {
+        name // F1.., Space, Arrow.., etc. share the Code names
+    };
+    code.parse().ok()
+}
+
+/// Human label for a captured key: "A", "6", "F6", "Space".
+fn key_display(key: egui::Key) -> String {
+    let name = format!("{key:?}");
+    name.strip_prefix("Num").map(str::to_string).unwrap_or(name)
 }
 
 /// A labeled control block with a small uppercase caption.
@@ -227,11 +286,60 @@ fn led(ui: &mut egui::Ui, color: Color32) {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drain global-hotkey events: the stop hotkey works even when unfocused.
-        if let Some(stop_id) = self.stop_hotkey.as_ref().map(|h| h.id()) {
+        // Drain global-hotkey events: the toggle works even when unfocused.
+        if let Some(id) = self.hotkey.as_ref().map(|h| h.id()) {
             while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                if ev.id == stop_id && ev.state == HotKeyState::Pressed {
-                    self.stop();
+                if ev.id == id && ev.state == HotKeyState::Pressed {
+                    self.toggle();
+                }
+            }
+        }
+
+        // Capture mode: bind the next real key press (Esc cancels).
+        if self.capturing {
+            let captured = ui.input(|i| {
+                let key = i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                    _ => None,
+                });
+                (key, i.modifiers)
+            });
+            if let (Some(key), mods) = captured {
+                self.capturing = false;
+                if key != egui::Key::Escape {
+                    if let Some(code) = egui_key_to_code(key) {
+                        let mut parts: Vec<&str> = Vec::new();
+                        if mods.ctrl {
+                            parts.push("Ctrl");
+                        }
+                        if mods.shift {
+                            parts.push("Shift");
+                        }
+                        if mods.alt {
+                            parts.push("Alt");
+                        }
+                        if mods.mac_cmd {
+                            parts.push("Cmd");
+                        }
+                        let disp = key_display(key);
+                        parts.push(&disp);
+                        let mut gm = Modifiers::empty();
+                        if mods.ctrl {
+                            gm |= Modifiers::CONTROL;
+                        }
+                        if mods.shift {
+                            gm |= Modifiers::SHIFT;
+                        }
+                        if mods.alt {
+                            gm |= Modifiers::ALT;
+                        }
+                        if mods.mac_cmd {
+                            gm |= Modifiers::SUPER;
+                        }
+                        self.rebind(code, gm, parts.join("+"));
+                    } else {
+                        self.hotkey_error = Some("That key can't be used — try a letter, number, or F-key".into());
+                    }
                 }
             }
         }
@@ -353,6 +461,38 @@ impl eframe::App for App {
             });
         });
 
+        // --- Hotkey (rebindable, works while running) --------------------
+        block(ui, "HOTKEY", |ui| {
+            ui.horizontal(|ui| {
+                field_label(ui, "Start / stop");
+                ui.label(
+                    RichText::new(format!(" {} ", self.hotkey_label))
+                        .monospace()
+                        .size(12.0)
+                        .color(TEXT)
+                        .background_color(SURFACE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.capturing {
+                        if ui.button("Cancel").clicked() {
+                            self.capturing = false;
+                        }
+                        ui.label(RichText::new("Press a combo…").size(11.0).color(ACCENT));
+                    } else if ui.button("Change").clicked() {
+                        self.capturing = true;
+                        self.hotkey_error = None;
+                    }
+                });
+            });
+            if let Some(e) = &self.hotkey_error {
+                ui.add_space(4.0);
+                ui.label(RichText::new(e).size(11.0).color(DANGER));
+            } else {
+                ui.add_space(4.0);
+                ui.label(RichText::new("Works even when the window isn't focused").size(11.0).color(MUTED));
+            }
+        });
+
         // --- Error detail ------------------------------------------------
         if let Status::Error(e) = &status {
             ui.label(RichText::new(e).size(12.0).color(DANGER));
@@ -376,19 +516,6 @@ impl eframe::App for App {
             if ui.add_sized(vec2(w, 42.0), btn).clicked() {
                 self.start();
             }
-        }
-
-        // --- Footer ------------------------------------------------------
-        if self.stop_hotkey.is_some() {
-            ui.add_space(8.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new(format!("{STOP_HOTKEY_LABEL} stops from anywhere"))
-                        .size(11.0)
-                        .color(MUTED),
-                );
-            });
-            ui.add_space(4.0);
         }
 
         // While a run is in flight, keep repainting so the live count and
@@ -454,8 +581,8 @@ fn setup_style(ctx: &egui::Context) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 612.0])
-            .with_min_inner_size([340.0, 580.0]),
+            .with_inner_size([380.0, 684.0])
+            .with_min_inner_size([340.0, 640.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -464,13 +591,16 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
             let mut app = App::default();
-            // Best-effort: if the OS denies the hotkey, the app still works via the button.
+            // Best-effort: if the OS denies the default, the app still works via
+            // the button and the user can bind a different combo.
             if let Ok(manager) = GlobalHotKeyManager::new() {
                 let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F6);
                 if manager.register(hotkey).is_ok() {
-                    app.stop_hotkey = Some(hotkey);
-                    app.hotkey_manager = Some(manager);
+                    app.hotkey = Some(hotkey);
+                } else {
+                    app.hotkey_error = Some("Ctrl+Shift+F6 is unavailable — set another".into());
                 }
+                app.hotkey_manager = Some(manager);
             }
             Ok(Box::new(app))
         }),
