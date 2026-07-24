@@ -13,3 +13,6 @@ rusty-clicker-core = { path = "../core" }
 eframe = "0.35"
 rand = "0.8"
 global-hotkey = "0.8"
+directories = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

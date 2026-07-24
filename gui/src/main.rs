@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use std::path::PathBuf;
+
 use eframe::egui;
 use egui::{vec2, Color32, CornerRadius, RichText, Stroke};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -15,8 +17,74 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use rusty_clicker_core::{
     run, ClickPlan, Clicker, EnigoClicker, Interval, MouseButton, RealSleeper, Repeat, Target,
 };
+use serde::{Deserialize, Serialize};
 
 const DEFAULT_HOTKEY_LABEL: &str = "Ctrl+Shift+F6";
+
+// --- Persistence ---------------------------------------------------------
+// Settings live in the OS-conventional per-app config dir as config.toml:
+//   macOS   ~/Library/Application Support/rusty-clicker/config.toml
+//   Linux   ~/.config/rusty-clicker/config.toml
+//   Windows %APPDATA%\rusty-clicker\config.toml
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    interval_ms: u64,
+    jitter_on: bool,
+    jitter_max: u64,
+    button: String,
+    repeat_mode: String,
+    times: u64,
+    duration_secs: u64,
+    fixed_target: bool,
+    x: i32,
+    y: i32,
+    hotkey: Option<HotkeyConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HotkeyConfig {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+    cmd: bool,
+    code: String,
+    label: String,
+}
+
+fn config_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "rusty-clicker")
+        .map(|d| d.config_dir().join("config.toml"))
+}
+
+fn button_str(b: MouseButton) -> &'static str {
+    match b {
+        MouseButton::Left => "left",
+        MouseButton::Right => "right",
+        MouseButton::Middle => "middle",
+    }
+}
+fn button_from(s: &str) -> MouseButton {
+    match s {
+        "right" => MouseButton::Right,
+        "middle" => MouseButton::Middle,
+        _ => MouseButton::Left,
+    }
+}
+fn repeat_str(m: RepeatMode) -> &'static str {
+    match m {
+        RepeatMode::Forever => "forever",
+        RepeatMode::Times => "times",
+        RepeatMode::Duration => "duration",
+    }
+}
+fn repeat_from(s: &str) -> RepeatMode {
+    match s {
+        "times" => RepeatMode::Times,
+        "duration" => RepeatMode::Duration,
+        _ => RepeatMode::Forever,
+    }
+}
 
 // --- Palette -------------------------------------------------------------
 const BG: Color32 = Color32::from_rgb(0x16, 0x17, 0x1B);
@@ -84,6 +152,7 @@ struct App {
 
     hotkey_manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    hotkey_combo: Option<(Modifiers, Code)>,
     hotkey_label: String,
     capturing: bool,
     hotkey_error: Option<String>,
@@ -107,6 +176,7 @@ impl Default for App {
             status: Arc::new(Mutex::new(Status::Idle)),
             hotkey_manager: None,
             hotkey: None,
+            hotkey_combo: None,
             hotkey_label: DEFAULT_HOTKEY_LABEL.to_string(),
             capturing: false,
             hotkey_error: None,
@@ -228,13 +298,88 @@ impl App {
                 if let Some(old) = self.hotkey.replace(new) {
                     let _ = mgr.unregister(old);
                 }
+                self.hotkey_combo = Some((mods, code));
                 self.hotkey_label = label;
                 self.hotkey_error = None;
+                self.save_config();
             }
             Err(_) => {
                 self.hotkey_error = Some(format!("{label} is already in use — try another"));
             }
         }
+    }
+
+    fn to_config(&self) -> Config {
+        Config {
+            interval_ms: self.interval_ms,
+            jitter_on: self.jitter_on,
+            jitter_max: self.jitter_max,
+            button: button_str(self.button).to_string(),
+            repeat_mode: repeat_str(self.repeat_mode).to_string(),
+            times: self.times,
+            duration_secs: self.duration_secs,
+            fixed_target: self.fixed_target,
+            x: self.x,
+            y: self.y,
+            hotkey: self.hotkey_combo.map(|(m, c)| HotkeyConfig {
+                ctrl: m.contains(Modifiers::CONTROL),
+                shift: m.contains(Modifiers::SHIFT),
+                alt: m.contains(Modifiers::ALT),
+                cmd: m.contains(Modifiers::SUPER),
+                code: c.to_string(),
+                label: self.hotkey_label.clone(),
+            }),
+        }
+    }
+
+    fn apply_config(&mut self, cfg: Config) {
+        self.interval_ms = cfg.interval_ms;
+        self.jitter_on = cfg.jitter_on;
+        self.jitter_max = cfg.jitter_max;
+        self.button = button_from(&cfg.button);
+        self.repeat_mode = repeat_from(&cfg.repeat_mode);
+        self.times = cfg.times;
+        self.duration_secs = cfg.duration_secs;
+        self.fixed_target = cfg.fixed_target;
+        self.x = cfg.x;
+        self.y = cfg.y;
+        if let Some(hc) = cfg.hotkey {
+            if let Ok(code) = hc.code.parse::<Code>() {
+                let mut m = Modifiers::empty();
+                if hc.ctrl {
+                    m |= Modifiers::CONTROL;
+                }
+                if hc.shift {
+                    m |= Modifiers::SHIFT;
+                }
+                if hc.alt {
+                    m |= Modifiers::ALT;
+                }
+                if hc.cmd {
+                    m |= Modifiers::SUPER;
+                }
+                self.rebind(code, m, hc.label);
+            }
+        }
+    }
+
+    /// Load saved settings, if any. Missing or unreadable config is fine.
+    fn load_config(&mut self) {
+        let Some(path) = config_path() else { return };
+        let Ok(text) = std::fs::read_to_string(path) else { return };
+        if let Ok(cfg) = toml::from_str::<Config>(&text) {
+            self.apply_config(cfg);
+        }
+    }
+
+    /// Best-effort save; a read-only config dir shouldn't crash the app.
+    fn save_config(&self) {
+        let Some(path) = config_path() else { return };
+        let Ok(text) = toml::to_string_pretty(&self.to_config()) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, text);
     }
 }
 
@@ -518,6 +663,11 @@ impl eframe::App for App {
             }
         }
 
+        // Persist the final state (form edits included) as the window closes.
+        if ui.ctx().input(|i| i.viewport().close_requested()) {
+            self.save_config();
+        }
+
         // While a run is in flight, keep repainting so the live count and
         // hotkey events keep flowing.
         if running {
@@ -581,8 +731,9 @@ fn setup_style(ctx: &egui::Context) {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([380.0, 684.0])
-            .with_min_inner_size([340.0, 640.0]),
+            // Tall enough for the worst case (fixed-point + a stop sub-row both showing).
+            .with_inner_size([380.0, 744.0])
+            .with_min_inner_size([340.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -594,14 +745,18 @@ fn main() -> eframe::Result<()> {
             // Best-effort: if the OS denies the default, the app still works via
             // the button and the user can bind a different combo.
             if let Ok(manager) = GlobalHotKeyManager::new() {
-                let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::F6);
+                let mods = Modifiers::CONTROL | Modifiers::SHIFT;
+                let hotkey = HotKey::new(Some(mods), Code::F6);
                 if manager.register(hotkey).is_ok() {
                     app.hotkey = Some(hotkey);
+                    app.hotkey_combo = Some((mods, Code::F6));
                 } else {
                     app.hotkey_error = Some("Ctrl+Shift+F6 is unavailable — set another".into());
                 }
                 app.hotkey_manager = Some(manager);
             }
+            // Saved settings override the defaults (and rebind the hotkey).
+            app.load_config();
             Ok(Box::new(app))
         }),
     )
