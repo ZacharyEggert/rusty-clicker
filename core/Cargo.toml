@@ -1,0 +1,9 @@
+[package]
+name = "rusty-clicker-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+enigo = "0.6"
+rand = "0.8"
