@@ -5,7 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use std::path::PathBuf;
@@ -152,6 +152,7 @@ struct App {
 
     hotkey_manager: Option<GlobalHotKeyManager>,
     hotkey: Option<HotKey>,
+    hotkey_rx: Option<mpsc::Receiver<GlobalHotKeyEvent>>,
     hotkey_combo: Option<(Modifiers, Code)>,
     hotkey_label: String,
     capturing: bool,
@@ -176,6 +177,7 @@ impl Default for App {
             status: Arc::new(Mutex::new(Status::Idle)),
             hotkey_manager: None,
             hotkey: None,
+            hotkey_rx: None,
             hotkey_combo: None,
             hotkey_label: DEFAULT_HOTKEY_LABEL.to_string(),
             capturing: false,
@@ -430,15 +432,20 @@ fn led(ui: &mut egui::Ui, color: Color32) {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Drain global-hotkey events: the toggle works even when unfocused.
-        if let Some(id) = self.hotkey.as_ref().map(|h| h.id()) {
-            while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
-                if ev.id == id && ev.state == HotKeyState::Pressed {
-                    self.toggle();
-                }
+    // Runs even while the window is hidden/unfocused, whenever the hotkey
+    // handler requests a repaint — so the toggle fires without focusing us.
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (Some(id), Some(rx)) = (self.hotkey.as_ref().map(|h| h.id()), &self.hotkey_rx) else {
+            return;
+        };
+        while let Ok(ev) = rx.try_recv() {
+            if ev.id == id && ev.state == HotKeyState::Pressed {
+                self.toggle();
             }
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
 
         // Capture mode: bind the next real key press (Esc cancels).
         if self.capturing {
@@ -668,8 +675,7 @@ impl eframe::App for App {
             self.save_config();
         }
 
-        // While a run is in flight, keep repainting so the live count and
-        // hotkey events keep flowing.
+        // While a run is in flight, keep repainting so the live count updates.
         if running {
             ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
@@ -742,6 +748,15 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             setup_style(&cc.egui_ctx);
             let mut app = App::default();
+            // egui sleeps when idle, so polling the hotkey channel in ui() only
+            // wakes on focus. Forward events and wake the loop ourselves.
+            let (tx, rx) = mpsc::channel();
+            let ctx = cc.egui_ctx.clone();
+            GlobalHotKeyEvent::set_event_handler(Some(move |ev| {
+                let _ = tx.send(ev);
+                ctx.request_repaint();
+            }));
+            app.hotkey_rx = Some(rx);
             // Best-effort: if the OS denies the default, the app still works via
             // the button and the user can bind a different combo.
             if let Ok(manager) = GlobalHotKeyManager::new() {
