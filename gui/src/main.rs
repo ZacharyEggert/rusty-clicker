@@ -264,7 +264,22 @@ impl App {
             };
             let mut clicker = CountingClicker { inner, count };
             let mut rng = rand::thread_rng();
+            // macOS App Nap throttles timers once we're backgrounded (e.g. behind
+            // a fullscreen game), stretching every sleep. Opt out for the run.
+            #[cfg(target_os = "macos")]
+            let activity = {
+                use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+                NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+                    NSActivityOptions::UserInitiatedAllowingIdleSystemSleep
+                        | NSActivityOptions::LatencyCritical,
+                    &NSString::from_str("autoclicking"),
+                )
+            };
             let result = run(&plan, &mut clicker, &RealSleeper, &mut rng, &stop);
+            #[cfg(target_os = "macos")]
+            unsafe {
+                objc2_foundation::NSProcessInfo::processInfo().endActivity(&activity)
+            };
             *status.lock().unwrap() = match result {
                 Ok(n) => Status::Done(n),
                 Err(e) => Status::Error(e),
